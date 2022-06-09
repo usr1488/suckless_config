@@ -316,9 +316,13 @@ drw_text(Drw *drw, int x, int y, unsigned int w, unsigned int h, unsigned int lp
 			if (len) {
 				memcpy(buf, utf8str, len);
 				buf[len] = '\0';
-				if (len < utf8strlen)
-					for (i = len; i && i > len - 3; buf[--i] = '.')
+
+				if (len < utf8strlen) {
+					for (i = len; i && i > len - 4; buf[--i] = '.')
 						; /* NOP */
+
+					buf[len ? --len : 0] = '\0';
+				}
 
 				if (render) {
 					ty = y + (h - usedfont->h) / 2 + usedfont->xfont->ascent;

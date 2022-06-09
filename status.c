@@ -17,7 +17,8 @@
 #define MEMINFO_PATH "/proc/meminfo"
 #define BATTERY_CAPACITY_PATH "/sys/class/power_supply/BAT0/capacity"
 #define BATTERY_STATUS_PATH "/sys/class/power_supply/BAT0/status"
-#define MILLIS_TO_MICROS(M) M * 1000 > 1000000 ? 1000000 : M * 1000 // usleep range check
+#define MILLIS_TO_NANOS(M) (M * 1000000 > 999999999 ? 999999999 : M * 1000000) // nanosleep range check
+#define CLOCKT_TO_NANOS(C) (MILLIS_TO_NANOS((C / CLOCKS_PER_SEC) * 1000))
 
 static char* ram_status(void);
 static char* battery_status(void);
@@ -60,8 +61,14 @@ void signal_handler(int, siginfo_t* info, void*) {
 
 // UTILS BEGIN
 
-// remove 'target' string from 'str' string
-// doesn't work with string literals passed to 'str', fails with segfault due to modification of .rodata segment
+static void die(char* msg) {
+	fprintf(stderr, "%s: %s\n", msg, strerror(errno));
+	exit(EXIT_FAILURE);
+}
+
+/* remove 'target' string from 'str' string
+ * doesn't work with string literals passed to 'str', fails with segfault due to modification of .rodata segment
+ */
 char* str_cut(char* str, char* target) {
 	int str_length = strlen(str);
 	int target_length = strlen(target);
@@ -92,8 +99,9 @@ char* str_cut(char* str, char* target) {
 	return str;
 }
 
-// remove whitespaces at the begining and at the end of 'str'
-// doesn't work with string literals, fails with segfault due to modification of .rodata segment
+/* remove whitespaces at the begining and at the end of 'str'
+ * doesn't work with string literals, fails with segfault due to modification of .rodata segment
+ */
 char* str_trim(char* str) {
 	int str_length = strlen(str);
 
@@ -119,10 +127,10 @@ char* str_trim(char* str) {
 	return str;
 }
 
-ssize_t read_all(int fd, void* ptr, size_t amount) {
+ssize_t pread_all(int fd, void* buffer, size_t amount, off_t offset) {
 	ssize_t total = 0, b;
 
-	while ((b = read(fd, ptr + total, amount - total))) {
+	while ((b = pread(fd, buffer + total, amount - total, offset + total))) {
 		if (b == -1) {
 			return b;
 		} else if ((total += b) == amount) {
@@ -145,16 +153,16 @@ void format_kb(int kb, char* buffer, int size) {
 
 // UTILS END
 
-// HANDLERS START
+// STATUS_PROVIDERS START
 
 char* ram_status(void) {
 	int mem_free, buffers, cached, sreclaimable;
 	char mem_used[ram.size];
 
 	fsync(ram.fd);
-	lseek(ram.fd, ram.size, SEEK_SET); // MemFree
 
-	if (read_all(ram.fd, ram.buffer, ram.size) == -1) {
+	// MemFree
+	if (pread_all(ram.fd, ram.buffer, ram.size, ram.size) == -1) {
 		perror("ram_status mem_free read error");
 		return "";
 	}
@@ -165,9 +173,8 @@ char* ram_status(void) {
 	str_trim(ram.buffer);
 	mem_free = atoi(ram.buffer);
 
-	lseek(ram.fd, ram.size * 3, SEEK_SET); // Buffers
-
-	if (read_all(ram.fd, ram.buffer, ram.size) == -1) {
+	// Buffers
+	if (pread_all(ram.fd, ram.buffer, ram.size, ram.size * 3) == -1) {
 		perror("ram_status buffers read error");
 		return "";
 	}
@@ -178,7 +185,8 @@ char* ram_status(void) {
 	str_trim(ram.buffer);
 	buffers = atoi(ram.buffer);
 
-	if (read_all(ram.fd, ram.buffer, ram.size) == -1) {
+	// Cached
+	if (pread_all(ram.fd, ram.buffer, ram.size, ram.size * 4) == -1) {
 		perror("ram_status cached read error");
 		return "";
 	}
@@ -189,9 +197,8 @@ char* ram_status(void) {
 	str_trim(ram.buffer);
 	cached = atoi(ram.buffer);
 
-	lseek(ram.fd, ram.size * 23, SEEK_SET); // SReclaimable
-
-	if (read_all(ram.fd, ram.buffer, ram.size) == -1) {
+	// SReclaimable
+	if (pread_all(ram.fd, ram.buffer, ram.size, ram.size * 23) == -1) {
 		perror("ram_status sreclaimable read error");
 		return "";
 	}
@@ -222,23 +229,21 @@ char* battery_status(void) {
 
 	memset(battery.buffer, 0, sizeof(battery.buffer));
 
-	if (read_all(battery.status_fd, battery.buffer, sizeof(battery.buffer)) == -1) {
+	// use pread(2) instead of read(2), to avoid calling lseek(2)
+	if (pread_all(battery.status_fd, battery.buffer, sizeof(battery.buffer), 0) == -1) {
 		perror("battery_status read "BATTERY_STATUS_PATH" error");
 		return "";
 	}
 
 	charging = !strcmp(battery.buffer, "Charging\n");
 
-	if ((b = read_all(battery.capacity_fd, capacity, sizeof(capacity))) == -1) {
+	if ((b = pread_all(battery.capacity_fd, capacity, sizeof(capacity), 0)) == -1) {
 		perror("battery_status read "BATTERY_CAPACITY_PATH" error");
 		return "";
 	}
 
 	capacity[b - 1] = 0; // replace \n
 	snprintf(battery.buffer, sizeof(battery.buffer), "%c%s %%", charging ? '+' : ' ', capacity);
-
-	lseek(battery.status_fd, 0, SEEK_SET);
-	lseek(battery.capacity_fd, 0, SEEK_SET);
 
 	return battery.buffer;
 }
@@ -275,7 +280,7 @@ char* date_status(void) {
 	return buffer;
 }
 
-// HANDLERS END
+// STATUS_PROVIDERS END
 
 // SETUP START
 
@@ -284,19 +289,17 @@ void ram_setup(void) {
 	char* tmp;
 
 	if ((ram.fd = open(MEMINFO_PATH, O_RDONLY)) == -1) {
-		perror("setup_ram open "MEMINFO_PATH" error");
-		exit(-1);
+		die("setup_ram open "MEMINFO_PATH" error");
 	}
 
 	if (!(tmp = malloc(read_size))) {
-		puts("setup_ram tmp malloc error");
-		exit(-1);
+		fputs("setup_ram tmp malloc error\n", stderr);
+		exit(EXIT_FAILURE);
 	}
 
 	while (1) {
-		if ((amount = read_all(ram.fd, tmp, read_size)) == -1) {
-			perror("setup_ram tmp read error");
-			exit(-1);
+		if ((amount = pread_all(ram.fd, tmp, read_size, 0)) == -1) {
+			die("setup_ram tmp read error");
 		}
 
 		for (int a = 0; a < amount; a++) {
@@ -307,25 +310,23 @@ void ram_setup(void) {
 			}
 		}
 
-		lseek(ram.fd, 0, SEEK_SET);
 		read_size *= 2;
+
 		if (!(tmp = realloc(tmp, read_size))) {
-			puts("setup_ram tmp realloc error");
-			exit(-1);
+			fputs("setup_ram tmp realloc error\n", stderr);
+			exit(EXIT_FAILURE);
 		}
 	}
 
 	mem_total_fmt:
 	if (!(ram.buffer = malloc(ram.size))) {
-		puts("setup_ram ram.buffer malloc error");
-		exit(-1);
+		fputs("setup_ram ram.buffer malloc error\n", stderr);
+		exit(EXIT_FAILURE);
 	}
 
-	lseek(ram.fd, 0, SEEK_SET);
-
-	if (read_all(ram.fd, ram.buffer, ram.size) == -1) {
-		perror("setup_ram ram.mem_total read error");
-		exit(-1);
+	// MemTotal
+	if (pread_all(ram.fd, ram.buffer, ram.size, 0) == -1) {
+		die("setup_ram ram.mem_total read error");
 	}
 
 	ram.buffer[ram.size - 1] = 0; // replace \n
@@ -334,16 +335,16 @@ void ram_setup(void) {
 	str_trim(ram.buffer);
 
 	if (!(ram.mem_total = malloc(strlen(ram.buffer) + 1))) {
-		puts("setup_ram ram.mem_total malloc error");
-		exit(-1);
+		fputs("setup_ram ram.mem_total malloc error\n", stderr);
+		exit(EXIT_FAILURE);
 	}
 
 	strcpy(ram.mem_total, ram.buffer);
 	format_kb(atoi(ram.mem_total), ram.buffer, ram.size);
 
 	if (!(ram.mem_total_fmt = malloc(strlen(ram.buffer) + 1))) {
-		puts("setup_ram ram.mem_total_fmt malloc error");
-		exit(-1);
+		fputs("setup_ram ram.mem_total_fmt malloc error\n", stderr);
+		exit(EXIT_FAILURE);
 	}
 
 	strcpy(ram.mem_total_fmt, ram.buffer);
@@ -353,42 +354,30 @@ void battery_setup(void) {
 	battery.capacity_fd = open(BATTERY_CAPACITY_PATH, O_RDONLY);
 
 	if (battery.capacity_fd == -1 && errno != ENOENT) {
-		perror("setup_battery_status open "BATTERY_CAPACITY_PATH" error");
-		exit(-1);
+		die("setup_battery_status open "BATTERY_CAPACITY_PATH" error");
 	}
 
 	battery.status_fd = open(BATTERY_STATUS_PATH, O_RDONLY);
 
 	if (battery.status_fd == -1 && errno != ENOENT) {
-		perror("setup_battery_status open "BATTERY_STATUS_PATH" error");
-		exit(-1);
+		die("setup_battery_status open "BATTERY_STATUS_PATH" error");
 	}
 }
 
 void layout_setup(void) {
 	char* symbols;
 
-	XkbIgnoreExtension(False);
-	XkbQueryExtension(
-			display, 
-			NULL, 
-			NULL, 
-			NULL, 
-			&(int) { XkbMajorVersion }, 
-			&(int) { XkbMinorVersion }
-	);
-
 	if (!(keyboard = XkbAllocKeyboard())) {
 		puts("setup_keyboard_layout XkbAllocKeyboard error");
-		exit(-1);
+		exit(EXIT_FAILURE);
 	}
 
 	XkbGetNames(display, XkbSymbolsNameMask, keyboard);
 	symbols = XGetAtomName(display, keyboard -> names -> symbols);
 
 	if (!(layout.buffer = malloc(strlen(symbols) + 1))) {
-		puts("setup_keyboard_layout layout.buffer malloc error");
-		exit(-1);
+		fputs("setup_keyboard_layout layout.buffer malloc error\n", stderr);
+		exit(EXIT_FAILURE);
 	}
 
 	strcpy(layout.buffer, symbols);
@@ -406,18 +395,17 @@ void setup(void) {
 	};
 
 	if (!(display = XOpenDisplay(0))) {
-		puts("setup XOpenDisplay error");
-		exit(-1);
+		fputs("setup XOpenDisplay error\n", stderr);
+		exit(EXIT_FAILURE);
 	}
 
 	if (!(window = RootWindow(display, DefaultScreen(display)))) {
-		puts("setup RootWindow error");
-		exit(-1);
+		fputs("setup RootWindow error\n", stderr);
+		exit(EXIT_FAILURE);
 	}
 
 	if (sigaction(SIGUSR1, &sig, NULL) == -1) {
-		perror("setup sigaction error");
-		exit(-1);
+		die("setup sigaction error");
 	}
 
 	ram_setup();
@@ -429,9 +417,13 @@ void setup(void) {
 
 void run(void) {
 	int status_text_size = MAX_SYMBOLS + 4; // plus 4 bsc of appending ' | ' in snprintf(3) and 0 byte at the end
-	int current_size = 0, str_length;
+	int current_size = 0;
+	int str_length;
+	long time;
 	char* status_text = malloc(status_text_size); 
 	char* str;
+	clock_t start;
+	struct timespec interval = { .tv_nsec = MILLIS_TO_NANOS(500) }, interval_rem = { 0 };
 	XTextProperty xtp = {
 		.encoding = XA_STRING,
 		.format = 8,
@@ -439,11 +431,13 @@ void run(void) {
 	};
 
 	if (!status_text) {
-		puts("run malloc error");
-		exit(-1);
+		fputs("run malloc error\n", stderr);
+		exit(EXIT_FAILURE);
 	}
 
 	while (1) {
+		start = clock();
+
 		for (int a = 0; a < sizeof(status_providers) / sizeof(*status_providers); a++) {
 			str = status_providers[a]();
 
@@ -468,7 +462,13 @@ void run(void) {
 		XSetTextProperty(display, window, &xtp, XA_WM_NAME);
 		XFlush(display);
 
-		usleep(MILLIS_TO_MICROS(500));
+		if (nanosleep(&interval, &interval_rem) == -1 && errno == EINTR) {
+			time = CLOCKT_TO_NANOS(clock() - start);
+			interval.tv_nsec -= interval_rem.tv_nsec;
+			interval.tv_nsec -= interval.tv_nsec - time > 0 ? time : 0;
+		} else if (interval.tv_nsec != MILLIS_TO_NANOS(500)) {
+			interval.tv_nsec = MILLIS_TO_NANOS(500);
+		}
 	}
 }
 
@@ -479,8 +479,7 @@ void check_dwm_pid_link(void) {
 	struct dirent* ent;
 
 	if (!dir) {
-		perror("check_dwm_pid_link opendir error");
-		exit(-1);
+		die("check_dwm_pid_link opendir error");
 	}
 
 	errno = 0;
@@ -490,13 +489,11 @@ void check_dwm_pid_link(void) {
 			snprintf(buffer, sizeof(buffer), "/proc/%d/comm", pid);
 
 			if ((comm_fd = open(buffer, O_RDONLY)) == -1) {
-				perror("check_dwm_pid_link open error");
-				exit(-1);
+				die("check_dwm_pid_link open error");
 			}
 
-			if (read_all(comm_fd, buffer, 3) == -1) {
-				perror("check_dwm_pid_link read error");
-				exit(-1);
+			if (pread_all(comm_fd, buffer, 3, 0) == -1) {
+				die("check_dwm_pid_link read error");
 			}
 
 			close(comm_fd);
@@ -511,11 +508,10 @@ void check_dwm_pid_link(void) {
 	}
 
 	if (errno) {
-		perror("check_dwm_pid_link readdir error");
-		exit(-1);
+		die("check_dwm_pid_link readdir error");
 	} else if (!pid) {
-		puts("check_dwm_pid_link dwm pid not found");
-		exit(-1);
+		fputs("check_dwm_pid_link dwm pid not found\n", stderr);
+		exit(EXIT_FAILURE);
 	}
 
 	closedir(dir);
@@ -528,4 +524,3 @@ int main() {
 	run();
 	XCloseDisplay(display);
 }
-

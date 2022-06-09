@@ -33,6 +33,7 @@
 #include <sys/wait.h>
 #include <X11/cursorfont.h>
 #include <X11/keysym.h>
+#include <X11/XF86keysym.h>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xproto.h>
@@ -244,6 +245,7 @@ static void zoom(const Arg *arg);
 static void shiftview(const Arg*);
 static void kblayout(const Arg*);
 static void setbright(const Arg*);
+static void setvolume(const Arg*);
 
 /* variables */
 static const char autostartblocksh[] = "autostart_blocking.sh";
@@ -691,7 +693,7 @@ drawbar(Monitor *m)
 	/* draw status first so it can be overdrawn by tags later */
 	if (m == selmon) { /* status is only drawn on selected monitor */
 		drw_setscheme(drw, scheme[SchemeNorm]);
-		tw = TEXTW(stext) - lrpad + 12; /* 2px right padding */
+		tw = TEXTW(stext) - lrpad + 12; /* 12px right padding */
 		drw_text(drw, m->ww - tw - 2 * sp, 0, tw, bh, 6, stext, 0);
 	}
 
@@ -2313,21 +2315,26 @@ void kblayout(const Arg* a) {
 }
 
 void setbright(const Arg* a) {
-	char cmd[20];
-	int lvl = a -> i;
-	
-	if (lvl > 0) {
-		if (lvl > 100) {
-			lvl = 100;
-		}
+	char cmd[27];
 
-		snprintf(cmd, sizeof(cmd), "xbacklight -inc %d", lvl);
-	} else if (lvl < 0) {
-		if (lvl < -100) {
-			lvl = -100;
-		}
+	if (a -> i > 0) {
+		snprintf(cmd, sizeof(cmd), "xbacklight -inc %d", a -> i);
+	} else if (a -> i < 0) {
+		snprintf(cmd, sizeof(cmd), "xbacklight -dec %d", (a -> i) * -1);
+	}
 
-		snprintf(cmd, sizeof(cmd), "xbacklight -dec %d", lvl * -1);
+	system(cmd);
+}
+
+void setvolume(const Arg* a) {
+	char cmd[30];
+
+	if (a -> i > 0) {
+		snprintf(cmd, sizeof(cmd), "amixer set Master %d+", a -> i);
+	} else if (a -> i < 0) {
+		snprintf(cmd, sizeof(cmd), "amixer set Master %d-", (a -> i) * -1);
+	} else {
+		snprintf(cmd, sizeof(cmd), "amixer set Master toggle");
 	}
 
 	system(cmd);
@@ -2347,14 +2354,14 @@ void spawn_status(void) {
 
 	if (sigaction(SIGUSR1, &act, NULL) == -1) {
 		perror("spawn_status sigaction error");
-		exit(-1);
+		exit(EXIT_FAILURE);
 	}
 
 	if (!(status_pid = fork())) {
 		execlp("status", "status", NULL);
 	} else if (status_pid == -1) {
 		perror("spawn_status fork error");
-		exit(-1);
+		exit(EXIT_FAILURE);
 	}
 }
 
@@ -2368,6 +2375,7 @@ int main(int argc, char *argv[]) {
 	if (!(dpy = XOpenDisplay(NULL)))
 		die("dwm: cannot open display");
 	checkotherwm();
+	spawn_status();
 	setup();
 #ifdef __OpenBSD__
 	if (pledge("stdio rpath proc exec", NULL) == -1)
@@ -2375,7 +2383,6 @@ int main(int argc, char *argv[]) {
 #endif /* __OpenBSD__ */
 	scan();
 	runautostart();
-	spawn_status();
 	run();
 	cleanup();
 	XCloseDisplay(dpy);
